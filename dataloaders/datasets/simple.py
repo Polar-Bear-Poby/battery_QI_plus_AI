@@ -86,9 +86,9 @@ class SimpleSegmentation(Dataset):
         draw = ImageDraw.Draw(mask)
 
         class_map = {
-            "battery_outline": 1,  # 배터리 외곽선 (초록)
+            "battery_outline": 3,  # 배터리 외곽선 (초록)
             "Damaged": 2,         # 손상 (빨강)
-            "Pollution": 3        # 오염 (파랑)
+            "Pollution": 1        # 오염 (파랑)
         }
 
         # 배터리 외곽선

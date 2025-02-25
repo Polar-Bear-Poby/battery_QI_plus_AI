@@ -14,6 +14,7 @@ from modeling.deeplab import *
 from dataloaders.utils import get_pascal_labels
 from utils.metrics import Evaluator
 from logger import LoggerHelper
+import itertools
 
 # 전역 변수 추가 (테스트용 확인 여부)
 checked_pred = False
@@ -59,93 +60,74 @@ class Tester(object):
         self.mIoUs = []
         self.elapsed_list = []  
 
-    def save_pr_json(self, pred, pr_json_path, imagename):
+    def save_pr_json(self, output_json_path, gt_json_path, pollution_contours, damaged_contours, battery_outline_contours):
         """
-        PR 마스크에서 외곽선을 추출하고 JSON 파일로 저장
+        모델 예측을 반영한 JSON 저장 (올바른 JSON 형식 유지, 픽셀 좌표 리스트 평탄화 적용)
         """
-        # pred가 numpy 배열인지 확인 후 변환
-        if not isinstance(pred, np.ndarray):
-            pred = np.array(pred)
+        # GT JSON 파일 로드
+        with open(gt_json_path, "r", encoding="utf-8") as f:
+            gt_json_data = json.load(f)
 
-        pred_mask = pred.astype(np.uint8)  # 이 부분 수정
+        # 기존 GT 데이터 복사
+        output_json_data = gt_json_data.copy()
 
-        # 외곽선 검출
-        contours, _ = cv2.findContours(pred_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # `defects` 리스트가 없으면 빈 리스트로 초기화
+        output_json_data.setdefault("defects", [])
 
-        json_data = {"swelling": {}, "defects": []}
+        # `defects`에 pollution 및 damaged 추가 (2D 리스트 → 1D 리스트 변환 적용)
+        output_json_data["defects"].extend([
+            {
+                "id": 2,
+                "name": "Pollution",
+                "points": list(itertools.chain.from_iterable(instance["contour"]))
+            }
+            for instance in pollution_contours
+        ] + [
+            {
+                "id": 1,
+                "name": "Damaged",
+                "points": list(itertools.chain.from_iterable(instance["contour"]))
+            }
+            for instance in damaged_contours
+        ])
 
-        for contour in contours:
-            points = contour.reshape(-1, 2).tolist()  # (x, y) 좌표 변환
-            json_data["defects"].append({"name": "Predicted", "points": points})
+        # ✅ `swelling` 안에 `battery_outline` 저장 (defects에 포함하지 않음)
+        output_json_data.setdefault("swelling", {})
 
-        # JSON 저장
-        with open(pr_json_path, "w", encoding="utf-8") as f:
-            json.dump(json_data, f, indent=4)
+        output_json_data["swelling"]["battery_outline"] = list(
+            itertools.chain.from_iterable(itertools.chain.from_iterable(instance["contour"] for instance in battery_outline_contours))
+        )  # ✅ 2D → 1D 변환 적용
 
-    def add_pr_outline(self, image, pred):
-        """
-        PR 마스크에서 각 클래스의 개별 인스턴스를 구별하여 외곽선을 원본 이미지에 겹쳐서 저장
-        """
-        # PIL.Image 객체를 NumPy 배열로 변환
-        if isinstance(image, Image.Image):
-            image = np.array(image)
+        # `is_normal` 업데이트 (defects가 하나라도 존재하면 False, 없으면 True)
+        output_json_data["image_info"]["is_normal"] = len(output_json_data["defects"]) == 0
 
-        # 만약 4채널(RGBA)이면 3채널(RGB)로 변환
-        if image.shape[-1] == 4:
-            image = image[:, :, :3]
+        # 수정된 JSON 저장
+        with open(output_json_path, "w", encoding="utf-8") as f:
+            json.dump(output_json_data, f, indent=4, ensure_ascii=False)
 
-        # PR 마스크가 numpy 배열이 아닐 경우 변환
-        if not isinstance(pred, np.ndarray):
-            pred = np.array(pred)
 
-        # PR 마스크를 uint8로 변환
-        pred = pred.astype(np.uint8)
 
-        # 테스트용 한 번만 출력
-        global checked_pred
-        if not checked_pred:
-            print(f"Initial pred shape: {pred.shape}, dtype: {pred.dtype}")
-            checked_pred = True
+    def add_pr_outline(self, image, pollution_contours, damaged_contours, battery_outline_contours):
+        """모델 예측된 외곽선을 원본 이미지에 겹치는 함수"""
+        # ⚠️ PIL.Image → NumPy 배열로 변환 (OpenCV에서 사용 가능하도록)
+        image = np.array(image)
 
-        # PR 마스크가 RGB(3채널)인지 확인하고 변환 필요 시 변환
-        if len(pred.shape) == 3 and pred.shape[-1] == 3:
-            pred = cv2.cvtColor(pred, cv2.COLOR_RGB2GRAY)
-            print("Converted pred to Grayscale (1 channel)")
-
-        # 색상 매핑 (RGB 형식)
-        color_map = {
-            1: (0, 255, 0),   # 배터리 외곽선 - 초록색
-            2: (255, 0, 0),   # 손상 - 빨간색
-            3: (0, 0, 255)    # 오염 - 파란색
+        # 색상 정의
+        colors = {
+            "battery_outline": (255, 255, 0),  # 노란색
+            "damaged": (255, 165, 0),         # 주황색
+            "pollution": (0, 0, 255)          # 파란색
         }
 
-        # 개별 인스턴스 개수 저장
-        instance_counts = {}
+        # 외곽선 그리기 (최적화: zip 활용)
+        for contours, color in zip(
+            [battery_outline_contours, damaged_contours, pollution_contours],
+            [colors["battery_outline"], colors["damaged"], colors["pollution"]]
+        ):
+            for contour in contours:
+                cv2.drawContours(image, [np.array(contour["contour"]).reshape(-1, 1, 2)], -1, color, 5)
 
-        # 클래스별 외곽선 검출
-        for class_id, color in color_map.items():
-            # **단일 채널 (Grayscale)로 변환하여 오류 방지**
-            mask = (pred == class_id).astype(np.uint8) * 255
-
-            # 개별 인스턴스를 구별하기 위해 Connected Components 사용
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-            instance_counts[class_id] = num_labels - 1  # 배경(0) 제외
-
-            for i in range(1, num_labels):  # 0은 배경이므로 제외
-                instance_mask = (labels == i).astype(np.uint8) * 255
-                contours, _ = cv2.findContours(instance_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(image, contours, -1, color, 3)  # 원본 이미지에 외곽선 표시 (두께 3px)
-
-        # 결과 저장 경로 설정
-        save_path = "logs/result"
-        outlined_image = Image.fromarray(image)
-        outlined_image.save(f"{save_path}/외곽선.png")
-
-        # 인스턴스 개수를 JSON 파일로 저장
-        with open(f"{save_path}/instance_counts.json", "w", encoding="utf-8") as f:
-            json.dump(instance_counts, f, indent=4)
-
-        return outlined_image
+        return Image.fromarray(image)
 
 
     def save(self, array, id, type, resize=None):
@@ -157,7 +139,7 @@ class Tester(object):
             r[array == i] = self.color_map[i][0]
             g[array == i] = self.color_map[i][1]
             b[array == i] = self.color_map[i][2]
-    
+
         rgb = np.dstack((r, g, b))
 
         img = Image.fromarray(rgb.astype('uint8'))
@@ -169,7 +151,17 @@ class Tester(object):
 
         return filename
 
-    def add_mask_outline(image, mask, color, thickness=5):
+    def extract_contour_coordinates(self, mask, class_name):
+        """특정 클래스의 마스크에서 개별 객체의 외곽선 좌표를 추출 (최적화 버전)"""
+        binary_mask = (mask > 0).astype(np.uint8)  # 변환 연산 최소화
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        return [{
+            "class": class_name,
+            "contour": contour.reshape(-1, 2).tolist()
+        } for contour in contours]
+
+    def add_mask_outline(self, image, mask, color, thickness=5):
         """원본 이미지에 외곽선만 겹쳐서 표시"""
         image = image.copy()
         draw = ImageDraw.Draw(image)
@@ -211,11 +203,10 @@ class Tester(object):
                     for x in range(0 + self.args.offset_width, width - self.args.offset_width, crop_size):
                         for y in range(0 + self.args.offset_height, height - self.args.offset_height, crop_size):
                             box = (x, y,
-                                    x + crop_size if x + crop_size <  width else  width,
+                                    x + crop_size if x + crop_size < width else width,
                                     y + crop_size if y + crop_size < height else height)
-                            # image_cropped = np.array(image.crop(box))
-                            output = self.model(image[:, :, y : box[3], x : box[2]])
-                            pred[y : box[3], x : box[2]] = np.argmax(output[0].detach().cpu().clone().numpy(), axis=0)
+                            output = self.model(image[:, :, y:box[3], x:box[2]])
+                            pred[y:box[3], x:box[2]] = np.argmax(output[0].detach().cpu().clone().numpy(), axis=0)
                 else:
                     output = self.model(image)
                     pred = np.argmax(output[0].detach().cpu().clone().numpy(), axis=0)
@@ -240,13 +231,26 @@ class Tester(object):
             self.mIoUs.append(mIoU)
             self.elapsed_list.append(elapsed)
 
-            pr_json_path = os.path.join(self.args.save_dir, f"{os.path.splitext(os.path.basename(imagename[0]))[0]}_pr.json")
-            self.save_pr_json(pred, pr_json_path, imagename[0])
+            # 🔹 **GT JSON 파일 경로 설정**
+            gt_json_path = os.path.join(self.args.base_dir, f"masks/test/{savename}.json")
+            pr_json_path = os.path.join(self.args.save_dir, f"{savename}_pr.json")
 
-            # 📌 **PR 외곽선을 원본 이미지에 추가하여 저장**
-            pr_outline_image = self.add_pr_outline(Image.open(imagename[0]).convert("RGB"), pred)
-            pr_outline_image.save(os.path.join(self.args.save_dir, f"{os.path.splitext(os.path.basename(imagename[0]))[0]}_PR_외곽선_원본이미지.png"))
+            # 🔹 **세그멘테이션에서 개별 객체 외곽선 추출**
+            pollution_contours = self.extract_contour_coordinates((pred == 1).astype(np.uint8), "Pollution")
+            damaged_contours = self.extract_contour_coordinates((pred == 2).astype(np.uint8), "Damaged")
+            battery_outline_contours = self.extract_contour_coordinates((pred == 3).astype(np.uint8), "Battery_Outline")  # 추가
 
+            # 🔹 **JSON 저장 (배터리 외곽선도 포함)**
+            self.save_pr_json(pr_json_path, gt_json_path, pollution_contours, damaged_contours, battery_outline_contours)
+
+            # 🔹 **PR 외곽선을 원본 이미지에 추가하여 저장**
+            pr_outline_image = self.add_pr_outline(
+                Image.open(imagename[0]).convert("RGB"),
+                pollution_contours,
+                damaged_contours,
+                battery_outline_contours
+            )
+            pr_outline_image.save(os.path.join(self.args.save_dir, f"{savename}_PR_외곽선_원본이미지.png"))
 
         LoggerHelper.getLogger().info("********************************************************************************")
         LoggerHelper.getLogger().info(f"Evaluation Summary (timestamp: {calendar.timegm(time.gmtime())})")
